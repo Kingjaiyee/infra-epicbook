@@ -1,0 +1,12 @@
+# Terraform working files and state (state lives in Azure Storage)
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfplan
+crash.log
+crash.*.log
+
+# Local-only values
+*.auto.tfvars
+lab.env
