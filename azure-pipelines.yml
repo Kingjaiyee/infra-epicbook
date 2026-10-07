@@ -1,5 +1,154 @@
-   trigger: none
-   pool:
-     name: SelfHostedPool
-   steps:
-     - script: echo "Placeholder, replaced in Task 4"
+# EpicBook Infrastructure Pipeline: Validate -> Plan -> (approval) Apply -> Outputs
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+      - scripts/*
+      - azure-pipelines.yml
+
+pr: none
+
+pool:
+  name: SelfHostedPool
+
+variables:
+  - group: epicbook-secrets
+  - name: azureServiceConnection
+    value: 'azure-epicbook-wif'
+  - name: tfDir
+    value: '$(System.DefaultWorkingDirectory)/terraform'
+
+stages:
+  # ---------- Stage 1: Validate ----------
+  - stage: Validate
+    displayName: 'Validate'
+    jobs:
+      - job: Validate
+        displayName: 'Format and validate'
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: AzureCLI@2
+            displayName: 'terraform init, fmt and validate'
+            inputs:
+              azureSubscription: '${{ variables.azureServiceConnection }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: '$(tfDir)'
+              inlineScript: |
+                source ../scripts/tf-env.sh
+                terraform version
+                terraform init -input=false -no-color
+                terraform fmt -check -recursive
+                terraform validate -no-color
+
+  # ---------- Stage 2: Plan ----------
+  - stage: Plan
+    displayName: 'Plan'
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: Plan
+        displayName: 'Create and save the plan'
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: AzureCLI@2
+            displayName: 'terraform plan'
+            inputs:
+              azureSubscription: '${{ variables.azureServiceConnection }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: '$(tfDir)'
+              inlineScript: |
+                source ../scripts/tf-env.sh
+                terraform init -input=false -no-color
+                terraform plan -input=false -no-color -out=tfplan
+                # Guard: the saved plan must never contain the MySQL password
+                if terraform show -json tfplan | grep -qF -- "$TF_VAR_db_admin_password"; then
+                  echo "ERROR: the MySQL password was found in the saved plan"
+                  exit 1
+                fi
+                echo "Checked: the MySQL password is not in the saved plan"
+            env:
+              TF_VAR_admin_cidr: $(adminCidr)
+              TF_VAR_db_admin_username: $(mysqlAdminUsername)
+              TF_VAR_db_admin_password: $(mysqlAdminPassword)
+
+          # Only the plan file is published. State stays in Azure Storage.
+          - publish: '$(tfDir)/tfplan'
+            artifact: 'tfplan'
+            displayName: 'Publish the reviewed plan'
+
+  # ---------- Stage 3: Apply (waits for approval on the environment) ----------
+  - stage: Apply
+    displayName: 'Apply'
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: Apply
+        displayName: 'Apply the approved plan'
+        environment: 'epicbook-infra'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - download: current
+                  artifact: 'tfplan'
+                  displayName: 'Download the reviewed plan'
+
+                - task: AzureCLI@2
+                  displayName: 'terraform apply tfplan'
+                  inputs:
+                    azureSubscription: '${{ variables.azureServiceConnection }}'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    workingDirectory: '$(tfDir)'
+                    inlineScript: |
+                      source ../scripts/tf-env.sh
+                      cp "$(Pipeline.Workspace)/tfplan/tfplan" ./tfplan
+                      terraform init -input=false -no-color
+                      # Applies exactly the saved plan; no new plan is made here
+                      terraform apply -input=false -no-color tfplan
+                  env:
+                    # Ephemeral variables are not saved in the plan, so apply needs it again
+                    TF_VAR_db_admin_password: $(mysqlAdminPassword)
+
+  # ---------- Stage 4: Outputs ----------
+  - stage: Outputs
+    displayName: 'Outputs'
+    dependsOn: Apply
+    condition: succeeded()
+    jobs:
+      - job: Outputs
+        displayName: 'Show the handoff values'
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: AzureCLI@2
+            displayName: 'Print the four non-sensitive outputs'
+            inputs:
+              azureSubscription: '${{ variables.azureServiceConnection }}'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: '$(tfDir)'
+              inlineScript: |
+                source ../scripts/tf-env.sh
+                terraform init -input=false -no-color > /dev/null
+                echo "Values for the Terraform-to-Ansible handoff:"
+                for name in app_public_ip backend_ansible_host backend_private_ip mysql_fqdn; do
+                  printf '  %-21s = %s\n' "$name" "$(terraform output -raw "$name")"
+                done
